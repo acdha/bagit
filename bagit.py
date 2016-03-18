@@ -73,14 +73,23 @@ if sys.version_info[0] >= 3:
     BOM = BOM.decode('utf-8')
 
 
-def make_bag(bag_dir, bag_info=None, processes=1, checksum=None):
+def make_bag(bag_dir, bag_info=None, processes=1, checksum=None, output_path=None):
     """
     Convert a given directory into a bag. You can pass in arbitrary
     key/value pairs to put into the bag-info.txt metadata file as
     the bag_info dictionary.
     """
     bag_dir = os.path.abspath(bag_dir)
-    LOGGER.info("creating bag for directory %s", bag_dir)
+
+    if output_path is None:
+        output_path = bag_dir
+        LOGGER.info("creating bag for directory %s", bag_dir)
+    else:
+        LOGGER.info("creating bag for directory %s in %s", bag_dir, output_path)
+
+    if not os.path.isdir(output_path) or not os.access(output_path, os.W_OK):
+        raise RuntimeError('Output path "%s" should be a writable directory' % output_path)
+
     # assume md5 checksum if not specified
     if not checksum:
         checksum = ['md5']
@@ -897,6 +906,9 @@ def _make_opt_parser():
     parser.add_option('--validate', action='store_true', dest='validate')
     parser.add_option('--fast', action='store_true', dest='fast')
 
+    parser.add_option('--output-path', action='store',
+                      help='Create the back in this location rather than the source directory')
+
     # optionally specify which checksum algorithm(s) to use when creating a bag
     # NOTE: could generate from checksum_algos ?
     parser.add_option('--md5', action='append_const', dest='checksum', const='md5',
@@ -930,6 +942,9 @@ def main():
     opt_parser = _make_opt_parser()
     opts, args = opt_parser.parse_args()
 
+    if opts.validate and opts.output_path:
+        opt_parser.error('--output-path can only be used when creating bags')
+
     if opts.processes < 0:
         opt_parser.error("number of processes needs to be 0 or more")
 
@@ -955,9 +970,11 @@ def main():
         # make the bag
         else:
             try:
-                make_bag(bag_dir, bag_info=opt_parser.bag_info,
+                make_bag(bag_dir,
+                         bag_info=opt_parser.bag_info,
                          processes=opts.processes,
-                         checksum=opts.checksum)
+                         checksum=opts.checksum,
+                         output_path=opts.output_path)
             except Exception as exc:
                 LOGGER.error("Failed to create bag in %s: %s", bag_dir, exc, exc_info=True)
                 rc = 1
