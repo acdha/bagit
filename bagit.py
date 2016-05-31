@@ -38,6 +38,7 @@ import multiprocessing
 import optparse
 import os
 import re
+import shutil
 import signal
 import sys
 import tempfile
@@ -73,96 +74,118 @@ if sys.version_info[0] >= 3:
     BOM = BOM.decode('utf-8')
 
 
-def make_bag(bag_dir, bag_info=None, processes=1, checksum=None, output_path=None):
+def make_bag(source_dir, bag_info=None, processes=1, checksum=None, output_dir=None):
     """
     Convert a given directory into a bag. You can pass in arbitrary
     key/value pairs to put into the bag-info.txt metadata file as
     the bag_info dictionary.
     """
-    bag_dir = os.path.abspath(bag_dir)
-
-    if output_path is None:
-        output_path = bag_dir
-        LOGGER.info("creating bag for directory %s", bag_dir)
-    else:
-        LOGGER.info("creating bag for directory %s in %s", bag_dir, output_path)
-
-    if not os.path.isdir(output_path) or not os.access(output_path, os.W_OK):
-        raise RuntimeError('Output path "%s" should be a writable directory' % output_path)
 
     # assume md5 checksum if not specified
     if not checksum:
         checksum = ['md5']
+    elif not isinstance(checksum, (list, tuple)):
+        raise TypeError('`checksum` should be a list or tuple of algorithm names')
 
-    if not os.path.isdir(bag_dir):
-        LOGGER.error("no such bag directory %s", bag_dir)
-        raise RuntimeError("no such bag directory %s" % bag_dir)
+    source_dir = os.path.abspath(source_dir)
 
-    old_dir = os.path.abspath(os.path.curdir)
-    os.chdir(bag_dir)
+    if not os.path.isdir(source_dir):
+        LOGGER.error("no such bag directory %s", source_dir)
+        raise RuntimeError("no such bag directory %s" % source_dir)
 
-    try:
-        unbaggable = _can_bag(os.curdir)
-        if unbaggable:
-            LOGGER.error("no write permissions for the following directories and files: \n%s", unbaggable)
-            raise BagError("Not all files/folders can be moved.")
-        unreadable_dirs, unreadable_files = _can_read(os.curdir)
-        if unreadable_dirs or unreadable_files:
-            if unreadable_dirs:
-                LOGGER.error("The following directories do not have read permissions: \n%s", unreadable_dirs)
-            if unreadable_files:
-                LOGGER.error("The following files do not have read permissions: \n%s", unreadable_files)
-            raise BagError("Read permissions are required to calculate file fixities.")
-        else:
-            LOGGER.info("creating data dir")
+    if not os.access(source_dir, os.R_OK):
+        raise RuntimeError("Cannot read from source directory %s" % source_dir)
 
-            cwd = os.getcwd()
-            temp_data = tempfile.mkdtemp(dir=cwd)
+    if output_dir is None:
+        output_dir = source_dir
+        LOGGER.info("creating bag in place from directory %s", source_dir)
+    else:
+        output_dir = os.path.abspath(output_dir)
+        LOGGER.info("creating bag in %s from %s ", source_dir, output_dir)
 
-            for f in os.listdir('.'):
-                if os.path.abspath(f) == temp_data:
-                    continue
-                new_f = os.path.join(temp_data, f)
-                LOGGER.info("moving %s to %s", f, new_f)
-                os.rename(f, new_f)
+    bag_in_place = output_dir == source_dir
 
-            LOGGER.info("moving %s to %s", temp_data, 'data')
-            os.rename(temp_data, 'data')
+    if not os.path.isdir(output_dir) or not os.access(output_dir, os.W_OK):
+        raise RuntimeError('Output path "%s" should be a writable directory' % output_dir)
 
-            # permissions for the payload directory should match those of the
-            # original directory
-            os.chmod('data', os.stat(cwd).st_mode)
+    # TODO: review and document how we want to handle pre-existing bags
+    output_data_dir = os.path.join(output_dir, 'data')
+    if not bag_in_place and os.path.exists(output_data_dir):
+        raise RuntimeError('Copying files to a pre-existing bag is not supported')
 
-            for c in checksum:
-                LOGGER.info("writing manifest-%s.txt", c)
-                Oxum = _make_manifest('manifest-%s.txt' % c, 'data', processes, c)
+    # FIXME: Confirm full test coverage of this branch:
+    unbaggable = _can_bag(source_dir)
+    if unbaggable and bag_in_place:
+        LOGGER.error("no write permissions for the following directories and files: \n%s", unbaggable)
+        raise BagError("Not all files/folders can be moved.")
 
-            LOGGER.info("writing bagit.txt")
-            txt = """BagIt-Version: 0.97\nTag-File-Character-Encoding: UTF-8\n"""
-            with open("bagit.txt", "w") as bagit_file:
-                bagit_file.write(txt)
+    unreadable_dirs, unreadable_files = _can_read(source_dir)
+    if unreadable_dirs or unreadable_files:
+        if unreadable_dirs:
+            LOGGER.error("The following directories do not have read permissions: \n%s", unreadable_dirs)
+        if unreadable_files:
+            LOGGER.error("The following files do not have read permissions: \n%s", unreadable_files)
+        raise BagError("Read permissions are required to calculate file fixities.")
 
-            LOGGER.info("writing bag-info.txt")
-            if bag_info is None:
-                bag_info = {}
+    # Now we're ready to actually start making durable changes:
+    LOGGER.info("creating working data dir in %s", output_dir)
 
-            # allow 'Bagging-Date' and 'Bag-Software-Agent' to be overidden
-            if 'Bagging-Date' not in bag_info:
-                bag_info['Bagging-Date'] = date.strftime(date.today(), "%Y-%m-%d")
-            if 'Bag-Software-Agent' not in bag_info:
-                bag_info['Bag-Software-Agent'] = 'bagit.py <http://github.com/libraryofcongress/bagit-python>'
-            bag_info['Payload-Oxum'] = Oxum
-            _make_tag_file('bag-info.txt', bag_info)
+    if bag_in_place:
+        temp_data = tempfile.mkdtemp(dir=output_dir, prefix='bagit-partial-data')
 
-            for c in checksum:
-                _make_tagmanifest_file(c, bag_dir)
-    except Exception:
-        LOGGER.exception("An error occurred creating the bag")
-        raise
-    finally:
-        os.chdir(old_dir)
+        LOGGER.info("Collecting files into %s", temp_data)
 
-    return Bag(bag_dir)
+        for source_f in os.listdir(source_dir):
+            source_f = os.path.join(source_dir, source_f)
+
+            if os.path.samefile(source_f, temp_data):
+                continue
+
+            output_f = os.path.join(temp_data, source_f)
+
+            LOGGER.info("moving %s to %s", source_f, output_f)
+            os.rename(source_f, output_f)
+
+        LOGGER.info("Renaming %s to %s", temp_data, 'data')
+        os.rename(temp_data,
+                  os.path.join(output_dir, 'data'))
+
+        for c in checksum:
+            LOGGER.info("writing manifest-%s.txt", c)
+            Oxum = _make_manifest(os.path.join(output_dir, 'manifest-%s.txt' % c),
+                                  source_dir,
+                                  processes=processes,
+                                  algorithm=c)
+    else:
+        LOGGER.info("copying %s to %s", source_dir, output_dir)
+        copy_and_checksum(source_dir, output_dir, algorithms=checksum)
+
+    LOGGER.info("writing bagit.txt")
+    txt = """BagIt-Version: 0.97\nTag-File-Character-Encoding: UTF-8\n"""
+    with open(os.path.join(output_dir, "bagit.txt"), "w") as bagit_file:
+        bagit_file.write(txt)
+
+    LOGGER.info("writing bag-info.txt")
+    if bag_info is None:
+        bag_info = {}
+
+    # allow 'Bagging-Date' and 'Bag-Software-Agent' to be overidden
+    if 'Bagging-Date' not in bag_info:
+        bag_info['Bagging-Date'] = date.strftime(date.today(), "%Y-%m-%d")
+    if 'Bag-Software-Agent' not in bag_info:
+        bag_info['Bag-Software-Agent'] = 'bagit.py <http://github.com/libraryofcongress/bagit-python>'
+    bag_info['Payload-Oxum'] = Oxum
+    _make_tag_file('bag-info.txt', bag_info)
+
+    for c in checksum:
+        _make_tagmanifest_file(c, output_dir)
+
+    # permissions for the payload directory should match those of the
+    # original directory
+    os.chmod(os.path.join(output_dir, 'data'),
+             os.stat(source_dir).st_mode)
+
+    return Bag(output_dir)
 
 
 class Bag(object):
@@ -730,7 +753,7 @@ def _make_tag_file(bag_info_path, bag_info):
                 f.write("%s: %s\n" % (h, txt))
 
 
-def _make_manifest(manifest_file, data_dir, processes, algorithm='md5'):
+def _make_manifest(manifest_file, data_dir, processes=1, algorithm='md5'):
     LOGGER.info('writing manifest with %s processes', processes)
 
     if algorithm == 'md5':
@@ -760,8 +783,8 @@ def _make_manifest(manifest_file, data_dir, processes, algorithm='md5'):
             num_files += 1
             total_bytes += byte_count
             manifest.write("%s  %s\n" % (digest, _encode_filename(filename)))
-        manifest.close()
-        return "%s.%s" % (total_bytes, num_files)
+
+    return "%s.%s" % (total_bytes, num_files)
 
 
 def _make_tagmanifest_file(alg, bag_dir):
@@ -906,7 +929,7 @@ def _make_opt_parser():
     parser.add_option('--validate', action='store_true', dest='validate')
     parser.add_option('--fast', action='store_true', dest='fast')
 
-    parser.add_option('--output-path', action='store',
+    parser.add_option('--output-directory', '-o', action='store',
                       help='Create the back in this location rather than the source directory')
 
     # optionally specify which checksum algorithm(s) to use when creating a bag
@@ -942,8 +965,8 @@ def main():
     opt_parser = _make_opt_parser()
     opts, args = opt_parser.parse_args()
 
-    if opts.validate and opts.output_path:
-        opt_parser.error('--output-path can only be used when creating bags')
+    if opts.validate and opts.output_directory:
+        opt_parser.error('--output-directory can only be used when creating bags')
 
     if opts.processes < 0:
         opt_parser.error("number of processes needs to be 0 or more")
@@ -974,7 +997,7 @@ def main():
                          bag_info=opt_parser.bag_info,
                          processes=opts.processes,
                          checksum=opts.checksum,
-                         output_path=opts.output_path)
+                         output_dir=opts.output_directory)
             except Exception as exc:
                 LOGGER.error("Failed to create bag in %s: %s", bag_dir, exc, exc_info=True)
                 rc = 1
