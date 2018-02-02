@@ -162,18 +162,7 @@ def make_bag(bag_dir, bag_info=None, processes=1, checksums=None, checksum=None,
     old_dir = os.path.abspath(os.path.curdir)
 
     try:
-        # TODO: These two checks are currently redundant since an unreadable directory will also
-        #       often be unwritable, and this code will require review when we add the option to
-        #       bag to a destination other than the source. It would be nice if we could avoid
-        #       walking the directory tree more than once even if most filesystems will cache it
-
-        unbaggable = _can_bag(bag_dir)
-
-        if unbaggable:
-            LOGGER.error(_("Unable to write to the following directories and files:\n%s"), unbaggable)
-            raise BagError(_("Missing permissions to move all files and directories"))
-
-        unreadable_dirs, unreadable_files = _can_read(bag_dir)
+        unreadable_dirs, unreadable_files = find_unreadable(bag_dir)
 
         if unreadable_dirs or unreadable_files:
             if unreadable_dirs:
@@ -183,6 +172,17 @@ def make_bag(bag_dir, bag_info=None, processes=1, checksums=None, checksum=None,
                 LOGGER.error(_("The following files do not have read permissions:\n%s"),
                              unreadable_files)
             raise BagError(_("Read permissions are required to calculate file fixities"))
+
+        unwritable_dirs, unwritable_files = find_unwritable(bag_dir)
+
+        if unwritable_dirs or unwritable_files:
+            if unwritable_dirs:
+                LOGGER.error(_("The following directories do not have write permissions:\n%s"),
+                             unwritable_dirs)
+            if unwritable_files:
+                LOGGER.error(_("The following files do not have write permissions:\n%s"),
+                             unwritable_files)
+            raise BagError(_("Missing permissions to move all files and directories"))
         else:
             LOGGER.info(_("Creating data directory"))
 
@@ -427,13 +427,7 @@ class Bag(object):
         if not os.access(self.path, os.R_OK | os.W_OK | os.X_OK):
             raise BagError(_('Cannot save bag to non-existent or inaccessible directory %s') % self.path)
 
-        unbaggable = _can_bag(self.path)
-        if unbaggable:
-            LOGGER.error(_("Missing write permissions for the following directories and files:\n%s"),
-                         unbaggable)
-            raise BagError(_("Missing permissions to move all files and directories"))
-
-        unreadable_dirs, unreadable_files = _can_read(self.path)
+        unreadable_dirs, unreadable_files = find_unreadable(self.path)
         if unreadable_dirs or unreadable_files:
             if unreadable_dirs:
                 LOGGER.error(_("The following directories do not have read permissions:\n%s"),
@@ -1213,47 +1207,48 @@ def _walk(data_dir):
             yield path
 
 
-def _can_bag(test_dir):
-    """Scan the provided directory for files which cannot be bagged due to insufficient permissions"""
-    unbaggable = []
-
-    if not os.access(test_dir, os.R_OK):
-        # We cannot continue without permission to read the source directory
-        unbaggable.append(test_dir)
-        return unbaggable
-
-    if not os.access(test_dir, os.W_OK):
-        unbaggable.append(test_dir)
-
-    for dirpath, dirnames, filenames in os.walk(test_dir):
-        for directory in dirnames:
-            full_path = os.path.join(dirpath, directory)
-            if not os.access(full_path, os.W_OK):
-                unbaggable.append(full_path)
-
-    return unbaggable
-
-
-def _can_read(test_dir):
+def find_unreadable(test_dir):
     """
-    returns ((unreadable_dirs), (unreadable_files))
-    """
-    unreadable_dirs = []
-    unreadable_files = []
+    Scans a directory searching for files and subdirectories which
+    cannot be read by the current user.
 
-    if not os.access(test_dir, os.R_OK):
-        unreadable_dirs.append(test_dir)
+    Returns (unreadable_dirs, unreadable_files) where both values are lists of
+    path names
+    """
+
+    return find_inaccessible(test_dir, os.R_OK)
+
+
+def find_unwritable(test_dir):
+    """
+    Scans a directory searching for files and subdirectories which
+    cannot be modified by the current user.
+
+    Returns (unwritable_dirs, unwritable_files) where both values are lists of
+    path names
+    """
+
+    return find_inaccessible(test_dir, os.W_OK)
+
+
+def find_inaccessible(test_dir, mode):
+    dirs = []
+    files = []
+
+    if not os.access(test_dir, mode):
+        dirs.append(test_dir)
     else:
         for dirpath, dirnames, filenames in os.walk(test_dir):
             for dn in dirnames:
                 full_path = os.path.join(dirpath, dn)
-                if not os.access(full_path, os.R_OK):
-                    unreadable_dirs.append(full_path)
+                if not os.access(full_path, mode):
+                    dirs.append(full_path)
             for fn in filenames:
                 full_path = os.path.join(dirpath, fn)
-                if not os.access(full_path, os.R_OK):
-                    unreadable_files.append(full_path)
-    return (tuple(unreadable_dirs), tuple(unreadable_files))
+                if not os.access(full_path, mode):
+                    files.append(full_path)
+
+    return dirs, files
 
 
 def generate_manifest_lines(filename, algorithms=DEFAULT_CHECKSUMS):

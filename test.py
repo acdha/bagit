@@ -547,7 +547,7 @@ class TestBag(SelfCleaningTestCase):
         with self.assertRaises(bagit.BagError) as error_catcher:
             bagit.make_bag(self.tmpdir, checksum=['sha256'])
 
-        self.assertEqual('Missing permissions to move all files and directories',
+        self.assertEqual('Read permissions are required to calculate file fixities',
                          str(error_catcher.exception))
 
     def test_make_bag_with_unreadable_subdirectory(self):
