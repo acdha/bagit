@@ -11,6 +11,7 @@ import logging
 import multiprocessing
 import os
 import re
+import shutil
 import signal
 import sys
 import tempfile
@@ -131,7 +132,8 @@ open_text_file = partial(codecs.open, encoding='utf-8', errors='strict')
 UNICODE_BYTE_ORDER_MARK = u'\uFEFF'
 
 
-def make_bag(bag_dir, bag_info=None, processes=1, checksums=None, checksum=None, encoding='utf-8'):
+def make_bag(source_dir, bag_info=None, dest_dir=None, processes=1,
+             checksums=None, checksum=None, encoding='utf-8'):
     """
     Convert a given directory into a bag. You can pass in arbitrary
     key/value pairs to put into the bag-info.txt metadata file as
@@ -146,97 +148,97 @@ def make_bag(bag_dir, bag_info=None, processes=1, checksums=None, checksum=None,
     if checksums is None:
         checksums = DEFAULT_CHECKSUMS
 
-    bag_dir = os.path.abspath(bag_dir)
+    if dest_dir is None:
+        dest_dir = source_dir
+
+    source_dir = os.path.abspath(source_dir)
+    dest_dir = os.path.abspath(dest_dir)
+
     cwd = os.path.abspath(os.path.curdir)
 
-    if cwd.startswith(bag_dir) and cwd != bag_dir:
+    if cwd.startswith(source_dir) and cwd != source_dir:
         raise RuntimeError(_('Bagging a parent of the current directory is not supported'))
 
-    LOGGER.info(_("Creating bag for directory %s"), bag_dir)
+    if not os.path.isdir(source_dir):
+        LOGGER.error(_("Bag directory %s does not exist"), source_dir)
+        raise RuntimeError(_("Bag directory %s does not exist") % source_dir)
 
-    if not os.path.isdir(bag_dir):
-        LOGGER.error(_("Bag directory %s does not exist"), bag_dir)
-        raise RuntimeError(_("Bag directory %s does not exist") % bag_dir)
+    # TODO: refactor these error checks into a function:
+    unreadable_dirs, unreadable_files = find_unreadable(source_dir)
+    if unreadable_dirs or unreadable_files:
+        if unreadable_dirs:
+            LOGGER.error(_("The following directories do not have read permissions:\n%s"),
+                         unreadable_dirs)
+        if unreadable_files:
+            LOGGER.error(_("The following files do not have read permissions:\n%s"),
+                         unreadable_files)
+        raise BagError(_("Read permissions are required to calculate file fixities"))
 
-    # FIXME: we should do the permissions checks before changing directories
-    old_dir = os.path.abspath(os.path.curdir)
+    unwritable_dirs, unwritable_files = find_unwritable(dest_dir)
+    if unwritable_dirs or unwritable_files:
+        if unwritable_dirs:
+            LOGGER.error(_("The following directories do not have write permissions:\n%s"),
+                         unwritable_dirs)
+        if unwritable_files:
+            LOGGER.error(_("The following files do not have write permissions:\n%s"),
+                         unwritable_files)
+        raise BagError(_("Missing permissions to move all files and directories"))
 
+    LOGGER.info(_("Creating payload data directory in %s"), dest_dir)
     try:
-        unreadable_dirs, unreadable_files = find_unreadable(bag_dir)
+        temp_data = tempfile.mkdtemp(dir=dest_dir)
 
-        if unreadable_dirs or unreadable_files:
-            if unreadable_dirs:
-                LOGGER.error(_("The following directories do not have read permissions:\n%s"),
-                             unreadable_dirs)
-            if unreadable_files:
-                LOGGER.error(_("The following files do not have read permissions:\n%s"),
-                             unreadable_files)
-            raise BagError(_("Read permissions are required to calculate file fixities"))
+        for f in os.listdir(source_dir):
+            if os.path.samefile(os.path.join(source_dir, f), temp_data):
+                continue
 
-        unwritable_dirs, unwritable_files = find_unwritable(bag_dir)
-
-        if unwritable_dirs or unwritable_files:
-            if unwritable_dirs:
-                LOGGER.error(_("The following directories do not have write permissions:\n%s"),
-                             unwritable_dirs)
-            if unwritable_files:
-                LOGGER.error(_("The following files do not have write permissions:\n%s"),
-                             unwritable_files)
-            raise BagError(_("Missing permissions to move all files and directories"))
-        else:
-            LOGGER.info(_("Creating data directory"))
-
-            # FIXME: if we calculate full paths we won't need to deal with changing directories
-            os.chdir(bag_dir)
-            cwd = os.getcwd()
-            temp_data = tempfile.mkdtemp(dir=cwd)
-
-            for f in os.listdir('.'):
-                if os.path.abspath(f) == temp_data:
-                    continue
-                new_f = os.path.join(temp_data, f)
-                LOGGER.info(_('Moving %(source)s to %(destination)s'),
-                            {'source': f, 'destination': new_f})
-                os.rename(f, new_f)
+            source_f = os.path.join(source_dir, f)
+            dest_f = os.path.join(temp_data, f)
 
             LOGGER.info(_('Moving %(source)s to %(destination)s'),
-                        {'source': temp_data, 'destination': 'data'})
-            os.rename(temp_data, 'data')
+                        {'source': source_f, 'destination': dest_f})
+            shutil.move(source_f, dest_f)
 
-            # permissions for the payload directory should match those of the
-            # original directory
-            os.chmod('data', os.stat(cwd).st_mode)
+        data_dir = os.path.join(dest_dir, 'data')
 
-            total_bytes, total_files = make_manifests('data', processes, algorithms=checksums,
-                                                      encoding=encoding)
+        LOGGER.info(_('Moving %(source)s to %(destination)s'),
+                    {'source': temp_data, 'destination': data_dir})
+        os.rename(temp_data, data_dir)
 
-            LOGGER.info(_("Creating bagit.txt"))
-            txt = """BagIt-Version: 0.97\nTag-File-Character-Encoding: UTF-8\n"""
-            with open_text_file('bagit.txt', 'w') as bagit_file:
-                bagit_file.write(txt)
+        # permissions for the payload directory should match those of the
+        # original directory
+        os.chmod(data_dir, os.stat(cwd).st_mode)
 
-            LOGGER.info(_("Creating bag-info.txt"))
-            if bag_info is None:
-                bag_info = {}
+        total_bytes, total_files = make_manifests(data_dir, processes, algorithms=checksums,
+                                                  encoding=encoding)
 
-            # allow 'Bagging-Date' and 'Bag-Software-Agent' to be overidden
-            if 'Bagging-Date' not in bag_info:
-                bag_info['Bagging-Date'] = date.strftime(date.today(), "%Y-%m-%d")
-            if 'Bag-Software-Agent' not in bag_info:
-                bag_info['Bag-Software-Agent'] = 'bagit.py v%s <%s>' % (VERSION, PROJECT_URL)
+        LOGGER.info(_("Creating bagit.txt"))
+        txt = """BagIt-Version: 0.97\nTag-File-Character-Encoding: UTF-8\n"""
+        with open_text_file(os.path.join(dest_dir, 'bagit.txt'), 'w') as bagit_file:
+            bagit_file.write(txt)
 
-            bag_info['Payload-Oxum'] = "%s.%s" % (total_bytes, total_files)
-            _make_tag_file('bag-info.txt', bag_info)
+        LOGGER.info(_("Creating bag-info.txt"))
+        if bag_info is None:
+            bag_info = {}
 
-            for c in checksums:
-                _make_tagmanifest_file(c, bag_dir, encoding='utf-8')
-    except Exception:
-        LOGGER.exception(_("An error occurred creating a bag in %s"), bag_dir)
+        # allow 'Bagging-Date' and 'Bag-Software-Agent' to be overidden
+        if 'Bagging-Date' not in bag_info:
+            bag_info['Bagging-Date'] = date.strftime(date.today(), "%Y-%m-%d")
+        if 'Bag-Software-Agent' not in bag_info:
+            bag_info['Bag-Software-Agent'] = 'bagit.py v%s <%s>' % (VERSION, PROJECT_URL)
+
+        bag_info['Payload-Oxum'] = "%s.%s" % (total_bytes, total_files)
+        _make_tag_file(os.path.join(dest_dir, 'bag-info.txt'),
+                       bag_info)
+
+        for c in checksums:
+            _make_tagmanifest_file(c, dest_dir, encoding='utf-8')
+    except:  # NOQA
+        LOGGER.exception(_("An error occurred creating a bag in %s"),
+                         dest_dir, exc_info=True)
         raise
-    finally:
-        os.chdir(old_dir)
 
-    return Bag(bag_dir)
+    return Bag(dest_dir)
 
 
 class Bag(object):
@@ -769,7 +771,7 @@ class Bag(object):
                     pool.terminate()
 
         # Any unhandled exceptions are probably fatal
-        except:
+        except:  # NOQA
             LOGGER.exception(_("Unable to calculate file hashes for %s"), self)
             raise
 
