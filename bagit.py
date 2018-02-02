@@ -1301,7 +1301,7 @@ def force_unicode_py2(s):
     if isinstance(s, str):
         return s.decode('utf-8')
     else:
-        return unicode(s)
+        return unicode(s)  # NOQA
 
 
 if sys.version_info > (3, 0):
